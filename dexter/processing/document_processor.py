@@ -1,4 +1,5 @@
 import time
+import os
 import logging
 
 import requests
@@ -11,6 +12,7 @@ from ..processing import ProcessingError
 from .crawlers import *  # noqa
 from .extractors import WatsonExtractor, CalaisExtractor, SourcesExtractor, PlacesExtractor
 
+GITLAB_KEY = os.getenv('GITLAB_KEY')
 
 class DocumentProcessor:
     log = logging.getLogger(__name__)
@@ -19,6 +21,7 @@ class DocumentProcessor:
     FEED_URL = 'http://newstools.co.za/dexter/articles/%s'
     FEED_USER = 'dexter'
     FEED_PASSWORD = None
+
 
     def __init__(self):
         self.newstools_crawler = NewstoolsCrawler()
@@ -156,14 +159,8 @@ class DocumentProcessor:
             yield item
 
     def process_feed_item(self, item):
-        """ Process an item pulled from an RSS feed.
+        """ Process an item pulled from an RSS feed. """
 
-        This checks to see if the document's URL already exists in the database.
-        If not, download the text for the URL and run processing on it, then
-        store it in the database. This commits the current transaction.
-
-        Returns the resulting document or None if the document already exists.
-        """
         try:
             self.log.info("Processing feed item: %s" % item)
             url = item['url'] = self.canonicalise_url(item['url'])
@@ -176,30 +173,21 @@ class DocumentProcessor:
                 self.log.info("URL has already been processed, ignoring: %s" % url)
                 return None
 
+            if 'newstools.co.za/api/v4/projects' in item.get('text_url', ''):
+                # Fetch the document text from GitLab using the token
+                response = requests.get(item['text_url'], headers={'PRIVATE-TOKEN': GITLAB_KEY})
+                response.raise_for_status()
+                item['document_text'] = response.text
+            else:
+                self.log.info("Not a GitLab URL, skipping token authentication.")
+
             if not self.newstools_crawler.offer(url):
                 self.log.info("No medium for URL, ignoring: %s" % url)
                 return
 
-            # this sets up basic info
             doc = self.newstools_crawler.crawl(item)
-            try:
-                # get the raw details
-                self.crawl(doc)
-            except HTTPError as e:
-                self.log.error("Error fetching document: %s" % e, exc_info=e)
-                raise ProcessingError("Error fetching document: %s" % (e,))
-
-            # is it sane?
-            # TODO: this breaks for isolezwe and other non-english media
-            if not doc.text or 'the' not in doc.text:
-                self.log.info("Document %s doesn't have reasonable-looking text, ignoring: %s..." % (url, doc.text[0:100]))
-                db.session.rollback()
-                return None
-
-            doc.analysis_nature = AnalysisNature.lookup(AnalysisNature.ANCHOR)
             self.process_document(doc)
 
-            # only add a document if it has sources or utterances
             if doc.sources or doc.utterances:
                 db.session.add(doc)
                 db.session.commit()
@@ -210,9 +198,10 @@ class DocumentProcessor:
                 self.log.info("Document has no sources or utterances, ignoring: %s" % url)
                 return None
 
-        except:
+        except Exception as e:
             db.session.rollback()
-            raise
+            self.log.error("Error processing feed item: %s" % e, exc_info=True)
+            raise ProcessingError("Error fetching document: %s" % e)
 
     def fetch_daily_feeds(self, day):
         """ Fetch the feed for +day+ and returns an ElementTree instance. """
